@@ -1,0 +1,413 @@
+------------------------------------------------------------------------
+--
+-- @author:   Andrew Zhilin
+-- @version: 0.7 beta
+-- @Copyright (C) 2008, 2009 by zOOn
+------------------------------------------------------------------------
+
+-- REFERENCES and CREDITS:
+
+-- 1. Philip Wadler. (April 1997) A prettier printer. Draft paper.
+-- http://homepages.inf.ed.ac.uk/wadler/papers/prettier/prettier.pdf
+
+-- 2. Daan Leijen (Oct 2001) PPrint, a prettier printer.
+-- http://research.microsoft.com/users/daan/download/pprint/pprint.html
+
+-- 3. Christian Lindig (March 2000) Strictly Pretty.
+-- http://www.citeulike.org/group/8/article/828964
+-- http://www.st.cs.uni-sb.de/~lindig/#quest 
+
+
+-- DOCUMENT ALGEBRA (exceptions from [2]):
+
+-- The concatenation operator (cat === <>) accociative and has empty
+-- as a left and right unit:
+
+--     (x <> y) <> z = x <> (y <> z) 
+--     x <> empty    = x
+--     empty <> x    = x
+
+-- The text combinator is a homomorphism from string concatenation to
+-- document concatenation.
+
+--     text(s1 .. s2) = text(s1) <> text(s2)
+
+-- The nest combinator is a homomorphism from addition to document
+-- composition. nest also distributes through document concatenation
+-- and is absorbed by text and align.
+
+--     nest (i+j,x)     = nest(i,nest(j,x)
+--     nest(0,x)        = x
+--     nest(i,x<>y)     = nest(i,x) <> nest(i,y)
+--     nest(i,empty)    = empty
+--     nest(i,text(s))  = text(s)
+--     nest(i,align(x)) = align(x)
+
+-- The group combinator is absorbed by empty. It is commutative with
+-- nest and align.
+
+--     group(empty)        = empty
+--     group(text(s) <> x) = text(s) <> group(x)
+--     group(nest(i,x))    = nest(i,(group(x)))
+--     group(align(x))     = align(group(x))
+
+-- The align combinator is absorbed by empty and text.
+
+--     align(empty)    = empty
+--     align(text(s))  = text(s)
+--     align(align(x)) = align(x)
+
+-- Let:  
+--     x <$>  y = x <> line <> y
+--     x <$$> y = x <> linebreak <> y
+--     x </>  y = x <> group(line) <> y 
+--     x <//> y = x <> group(linebreak) <> y 
+-- It follows that <$> is associative and that <$> and <> associate
+-- with each other. The same laws also hold for the other line break
+-- operators </>, <$$> and <//>.
+--     x <$> (y <$> z) = (x <$> y) <$> z
+--     x <>  (y <$> z) = (x <>  y) <$> z
+--     x <$> (y <>  z) = (x <$> y) <>  z
+
+--------------------------------------------------------------------------
+--                                                         IMPORTS etc. --
+--------------------------------------------------------------------------
+-- require'strict' -- DEBUG:
+local errfmt = require'errfmt'
+
+local print    = print
+local error    = error
+
+-- for 5.0
+local insert   = table.insert
+local tostring = tostring
+local rep      = string.rep
+local min,max  = math.min, math.max
+local type = type
+
+
+local spaces   = fun(n) -> rep(" ",n) end
+local compose  = fn(f,g)(x) => f(g(x)) end
+local identity = fn(...) => ... end
+
+
+--------------------------------------------------------------------------
+--                                                                 UTIL --
+--------------------------------------------------------------------------
+-- NOTE: proper list only
+
+local fun i2list(t) ->
+  local res = []
+  for i=#t,1,-1 do
+    res = t[i]::res
+  end
+  return res
+end
+
+local fun foldl
+  | f,seed,[]    -> seed
+  | f,seed,x::xs -> foldl(f,f(seed,x),xs)
+end
+
+--------------------------------------------------------------------------
+--                                                             Doc type --
+--------------------------------------------------------------------------
+
+-- Doc is:
+--     'Cat'     of Doc * Doc
+--     'Text'    of string
+--     'Nest'    of number * Doc
+--     'Break'   of string
+--     'Group'   of Doc
+--     'Column'  of function
+--     'Nesting' of function
+--     'Empty'
+
+local Doc_mt = {}
+Doc_mt.__index = Doc_mt
+
+local fun Doc
+  d@(  `Cat{_,_}
+     | `Text{_}
+     | `Nest{_,_}
+     | `Break{_}
+     | `Group{_}
+     | `Column{_}
+     | `Nesting{_}
+     | `Empty{}
+   )    -> setmetatable(d,Doc_mt)
+end
+
+local Empty = Doc(`Empty{})
+local isDoc = fun (d:'tab') -> getmetatable(d) == Doc_mt | _ -> false end
+
+--------------------------------------------------------------------------
+--                                     Basic combinators / Constructors --
+--------------------------------------------------------------------------
+
+local empty     = Empty
+local text      = fun (x) -> Doc(`Text{tostring(x)}) end
+local nest      = fun (i:'num',d:isDoc) -> Doc(`Nest{i,d}) end
+local group     = fun (d:isDoc) -> Doc(`Group{d}) end
+local column    = fun (proc:'fun') -> Doc(`Column{proc}) end
+local nesting   = fun (proc:'fun') -> Doc(`Nesting{proc}) end
+local line      = Doc(`Break{" "})
+local linebreak = Doc(`Break{""})
+local space     = text" "
+
+
+local softline  = group(line)
+local softbreak = group(linebreak)
+
+-- <>
+local fun cat
+  | (Empty, d:isDoc)
+  | (d:isDoc, Empty) -> d
+  | l:isDoc, r:isDoc -> Doc(`Cat{l,r})
+end
+
+-- <+>
+local fun catspace(x,y) -> x `cat`(space `cat` y) end
+
+-- <$$>
+local fun above x,y -> x `cat` (linebreak `cat` y) end
+
+-- <$>
+local fun abovespace x,y  -> x `cat` (line `cat` y) end
+
+-- <//>
+local fun abovesoft x,y -> x `cat` (softbreak `cat` y) end
+
+-- </>
+local fun abovesoftspace x,y -> x `cat` (softline `cat` y) end
+
+--------------------------------------------------------------------------
+--                                                          Combinators --
+--------------------------------------------------------------------------
+
+-- ## folddocs for lists
+
+-- foldDoc :: (Doc * Doc -> Doc) * Doc -> [Doc] -> Doc
+local fun foldDoc(infix:'fun',seed:isDoc) -> fun 
+    | xs@(_::_|[]) -> foldl(infix,seed,xs)
+  end
+end
+
+-- separateWith :: (Doc,('a->Doc)) -> (['a]->Doc)
+local fun separateWith(sep:isDoc,proc:'fun') -> fun 
+    | []    -> empty
+    | x::[] -> proc(x)
+    | x::xs ->foldDoc(fun(seed,o)->seed`cat`(proc(o)`cat`sep)end,proc(x))(xs)
+  end
+end
+
+-- ## folddoc for arrays
+-- ifoldDoc :: (Doc*Doc->Doc) -> {Doc} -> Doc
+local fun ifoldDoc(infix:'fun') -> fun
+    | {}  -> empty
+    | {x} -> x
+    | docs@{x,...} ->
+    local seed = x
+    for i=2, #docs do
+      seed = seed `infix` docs[i]
+    end
+    return seed
+  end
+end
+
+-- iseparateWith :: (Doc,('a->Doc)) -> ({'a}->Doc)
+local fun iseparateWith(sep:isDoc,proc:'fun') -> fun
+    | {}         -> empty
+    | {x}        -> proc(x)
+    | xs@{...}   ->
+    local seed = empty
+    for i=1,(#xs-1) do
+      seed = seed `cat` (proc(xs[i]) `cat` sep)
+    end
+    return seed `cat` proc(xs[#xs])
+  end
+end
+
+--------------------------------------------------------------------------
+--                                      Combinators from Haskell PPrint --
+--------------------------------------------------------------------------
+
+-- align, hang, indent 
+local align  = 
+  fn(doc) => column(fn(k)=>nesting(fn(i)=>nest(k-i,doc)end)end)end
+local hang   = fn(i,doc) => align(nest(i,doc)) end
+local indent = fn(i,doc) => hang(i,text(spaces(i)) `cat` doc) end
+
+-- fill, fillBreak
+local width = fun(doc:isDoc,f:'fun') ->
+  column(fn(k1)=>doc `cat` column(fn(k2)=>f(k2-k1)end)end)
+end
+
+local fillBreak = fun(i:'number',doc:isDoc) ->
+  width(doc, fun| w if w > i -> nest(i,linebreak)
+                | w -> text(spaces(i-w)) 
+             end)
+end
+
+local fill = fun(i:'number',doc:isDoc) ->
+  width(doc,fun| w if w >= i -> empty
+               | w -> text(spaces(i-w))
+            end)
+end
+
+--------------------------------------------------------------------------
+--                                                       IMPLEMENTATION --
+--------------------------------------------------------------------------
+-- TODO: layoutFast :: Doc -> string
+
+-- Mode
+local FL,BR  = {'Flat'},{'Break'}
+
+
+-- ### layout :: (Doc, int?, float?) -> string
+-- @doc  - doc to layout
+-- @w    - target page width
+-- @frac - fraction of ribbon width to page width
+local fun layout(doc:isDoc,w,frac) ->
+ 
+  w    or= 78
+  frac or= 0.6 
+  local ribbon = (w*frac) `min` w `max` 0
+
+  -- fits :: (int,int,Cells) -> boolean
+  -- @w - ribbon space left
+  -- @k - current column
+  -- Cells :: [{indent,Mode,Doc}]
+  local fun fits
+    | w,_,_ if w < 0              -> false
+    | _,_,[]                      -> true
+    | w,k,{i,m,Empty}        :: z -> fits(w,k,z)
+    | w,k,{i,m,`Cat{x,y}}    :: z -> fits(w,k,{i,m,x}::{i,m,y}::z)
+    | w,k,{i,m,`Nest{j,x}}   :: z -> fits(w,k,{i+j,m,x}::z)
+    | w,k,{i,m,`Text{s}}     :: z -> fits(w-#~s,k+#~s,z)
+    | w,k,{i,FL,`Break{s}}   :: z -> fits(w-#~s,k+#~s,z)
+    | w,k,{i,BR,`Break{_}}   :: z -> true
+    | w,k,{i,m,`Group{x}}    :: z -> fits(w,k,{i,m,x}::z)
+    | w,k,{i,m,`Column{f}}   :: z -> fits(w,k,{i,m,f(k)}::z)
+    | w,k,{i,m,`Nesting{f}}  :: z -> fits(w,k,{i,m,f(i)}::z)
+    | _,_,x -> error(tostring(x))
+  end
+
+  local fun push(t,x) -> t[#t+1]=x; return t end 
+  local fun nl(sb,n)  -> sb `push` ('\n'..spaces(n)) end
+
+  -- best :: sb,int,int,Cells -> sb
+  -- @sb - string buffer :: {string}
+  -- @n  - indentation of current line
+  -- @k  - current column
+  -- Cells :: [{indent,Mode,Doc}]
+  local fun best
+    | sb,n,k,[]  -> sb
+    | sb,n,k,{i,_,Empty}      :: z -> best(sb,n,k,z)
+    | sb,n,k,{i,m,`Cat{x,y}}  :: z -> best(sb,n,k,{i,m,x}::{i,m,y}::z)
+    | sb,n,k,{i,m,`Nest{j,x}} :: z -> best(sb,n,k,{i+j,m,x}::z)
+    | sb,n,k,{i,_,`Text{s}}   :: z -> best(sb`push`s,n,k+#~s,z)
+    | sb,n,k,{i,FL,`Break{s}} :: z -> best(sb`push`s,n,k+#~s,z)
+    | sb,n,k,{i,BR,`Break{_}} :: z -> best(nl(sb,i),i,i,z)
+    | sb,n,k,{i,FL,`Group{x}} :: z -> best(sb,w,k,{i,FL,x}::z)
+    | sb,n,k,{i,BR,`Group{x}} :: z -> do
+      local ribbonleft = (w-k) `min` (ribbon-k+n)
+      if fits(ribbonleft,k,{i,FL,x}::z) then
+        return best(sb,n,k,{i,FL,x}::z)
+      else
+        return best(sb,n,k,{i,BR,x}::z)
+      end
+    end
+    | sb,n,k,{i,m,`Column{f}}  :: z -> best(sb,n,k,{i,m,f(k)}::z)
+    | sb,n,k,{i,m,`Nesting{f}} :: z -> best(sb,n,k,{i,m,f(i)}::z)
+  end
+  
+  -- return of layout
+  return table.concat$best({},0,0,{0,BR,doc}::[])
+end -- end of layout
+
+--------------------------------------------------------------------------
+--                   __  __  ___  ___  _   _ _    ___                   --
+--                  |  \/  |/ _ \|   \| | | | |  | __|                  --
+--                  | |\/| | (_) | |) | |_| | |__| _|                   --
+--                  |_|  |_|\___/|___/ \___/|____|___|                  --
+--                                                                      --
+--------------------------------------------------------------------------
+module(...)
+--------------------------------------------------------------------------
+--                                                              EXPORTS --
+--------------------------------------------------------------------------
+
+-- layout
+_M.layout = layout
+
+-- Basic
+_M.isDoc      = isDoc
+
+_M.empty      = empty     
+_M.text       = text     
+_M.nest       = nest     
+_M.group      = group    
+_M.column     = column   
+_M.nesting    = nesting  
+_M.line       = line               -- \n | space
+_M.linebreak  = linebreak          -- \n | empty
+_M.softline   = group(line)
+_M.softbreak  = group(linebreak)
+_M.space      = space
+_M.cat        = cat                -- <>
+_M.catspace   = catspace           -- <+>
+_M.abovespace = abovespace         -- <$>
+_M.above      = above              -- <$$>
+
+_M.abovesoftspace = abovesoftspace -- </>
+_M.abovesoft      = abovesoft      -- <//>
+
+-- Primitives:
+_M.lparen    = text'('
+_M.rparen    = text')'
+_M.langle    = text'<'
+_M.rangle    = text'>'
+_M.lbrace    = text'{'
+_M.rbrace    = text'}'
+_M.lbracket  = text'['
+_M.rbracket  = text']'
+_M.backtick  = text'`'
+_M.squote    = text"'"
+_M.dquote    = text'"'
+_M.semi      = text';'
+_M.colon     = text':'
+_M.comma     = text','
+_M.dot       = text'.'
+_M.slash     = text'/'
+_M.backslash = text'\\'
+_M.assign    = text'='
+
+
+-- Combinators
+_M.foldDoc         = foldDoc
+_M.separateWith    = separateWith
+
+_M.ifoldDoc        = ifoldDoc
+_M.iseparateWith   = iseparateWith
+
+-- PPrint's combinators
+_M.indent    = indent
+_M.align     = align
+_M.hang      = hang
+_M.fill      = fill
+_M.fillBreak = fillBreak
+
+-- Methods:
+Doc_mt.type = (=>"Doc")
+Doc_mt.__tostring = layout
+Doc_mt.__add      = cat        -- <>
+Doc_mt.__sub      = catspace   -- <+>
+Doc_mt.__div      = abovespace -- <$>
+Doc_mt.__mul      = above      -- <$$>
+
+-- Misc
+_M.compose  = compose
+_M.identity = identity
+_M.i2list   = i2list
+

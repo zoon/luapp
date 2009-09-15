@@ -1,0 +1,39 @@
+-- ---------------------------------------------------------------------- --
+--         Wadler's Pretty Printer with Lua Pretty Printer module         --
+-- ---------------------------------------------------------------------- --
+Copyright (C) 2008, 2009 by Andrew Zhilin <andrew_zhilin@yahoo.com>
+Distributed under MIT license.
+
+
+Package contents:
+-------_---------
+zpp.lua        -- Wadler's Pretty Printer (undocumented, sorry)
+luapp.lua      -- Pretty Printer for lua structures
+errfmt.lua     -- error formatter
+test_luapp.lua -- tests, optional
+
+
+Some Notes:
+-----------
+
+For using lua pretty printer you shoud place files zpp.lua, errfmt.lua
+and luapp.lua somewhere in your $LUA_PATH. luapp module exports only
+one function 'pp' with signature:
+
+pp(any,[root-name],[page-width],[max-line-with]) -> string
+
+@root-name -- optional name for the topmost table if you expect it to
+be recvursive, default: "ROOT"
+
+@page-width -- optional max page width, default: 78
+
+@max-line-with -- optional fraction of the max desired line width to
+the page width, default: 0.6
+
+
+Minimal program:
+----------------
+    local M = require"luapp"
+    print(M.pp(_G,"_G"))
+
+Enjoy!

@@ -1,0 +1,264 @@
+--------------------------------------------------------------------------
+--  An attempt to write robust pretty-printer for lua structures.
+--
+--  @author: andrew_zhilin@yahoo.com
+--  @version: 0.6 beta
+--  @Copyright (C) 2008, 2009 by zOOn
+--------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+--                                                              IMPORTS --
+--------------------------------------------------------------------------
+local errfmt = require'errfmt'
+local zpp = require'zpp'
+
+local error = error
+
+local type     = type
+local pairs    = pairs
+local ipairs   = ipairs
+local format   = string.format
+local tostring = tostring
+local find     = string.find
+local sort     = table.sort
+local insert   = table.insert
+local unpack   = unpack
+
+local isDoc  = zpp.isDoc
+local empty  = zpp.empty
+local text   = zpp.text
+local line   = zpp.line
+local group  = zpp.group
+local align  = zpp.align
+local layout = zpp.layout
+
+local iseparateWith = zpp.iseparateWith
+local dot           = zpp.dot
+
+ -- misc
+local identity      = zpp.identity
+
+-- primitives
+local lbrace   = zpp.lbrace   
+local rbrace   = zpp.rbrace  
+local lbracket = zpp.lbracket
+local rbracket = zpp.rbracket
+local langle   = zpp.langle  
+local rangle   = zpp.rangle  
+local comma    = zpp.comma
+local dot      = zpp.dot
+local assign   = zpp.assign
+local backtick = zpp.backtick
+
+local dcolon   = text(" ::")
+
+local consnull   = text("[]")
+local consnullsp = text(" [] ")
+
+--------------------------------------------------------------------------
+--                   __  __  ___  ___  _   _ _    ___                   --
+--                  |  \/  |/ _ \|   \| | | | |  | __|                  --
+--                  | |\/| | (_) | |) | |_| | |__| _|                   --
+--                  |_|  |_|\___/|___/ \___/|____|___|                  --
+--                                                                      --
+--------------------------------------------------------------------------
+module(...)
+
+-- NOTE:  we use some intimate details here:
+-- 1. TAG key:
+local TAG = 'tag'
+-- 2. Cons has 'table' type.
+-- 3. Cons-null has 'string' type.
+
+--------------------------------------------------------------------------
+--                                                          COMBINATORS --
+--------------------------------------------------------------------------
+
+-- NOTE: 1 space aligned nest, sep after,line
+local fun encloseSep(lhs:isDoc,rhs:isDoc,sep:isDoc) -> 
+  fun (xs:'tab') ->
+    lhs+align(group(iseparateWith(sep+line,identity)(xs)))+rhs
+  end
+end
+
+-- tabled :: {Doc} -> Doc
+local tabled = encloseSep(zpp.lbrace,zpp.rbrace,zpp.comma)
+
+-- listed_proper :: {Doc} -> Doc
+local listed_proper = encloseSep(zpp.lbracket,zpp.rbracket,zpp.comma)
+
+-- listed :: {Doc}, Doc? -> Doc
+local fun listed
+ | docs,nil-> listed_proper(docs)
+ -- TODO: think about better presentation of improper list: (1 2 . 3)
+ --  Now: [1,2] :: 3 
+ | docs,tail -> encloseSep(empty,empty,dcolon){listed_proper(docs),tail}
+end
+
+
+local angles    = fn(x) => langle+x+rangle end
+local brackets  = fn(x) => lbracket+x+rbracket end
+local brkangles = fn(x) => lbracket+langle+x+rangle+rbracket end
+
+--------------------------------------------------------------------------
+--                                                              LUA2DOC --
+--------------------------------------------------------------------------
+local fun lua2doc(val,opt_root@(nil|_:'str'))->
+  
+  local root_path = text(opt_root or '<#ROOT#>')
+  local key,value -- forward declaration
+  local tracker = {}
+  
+  -- isLikeId : str -> bool
+  local fun isLikeId
+    | s:'str' if find(s,"^[%a_][%a%d_]*$") -> true
+    | _ -> false
+  end
+  
+  -- sort_pairs_by_key : ({kl,vl},{kr,vr}) -> bool
+  -- num then str then lexicographically by type(x)
+  local fun sort_pairs_by_key({lkey,_},{rkey,_}) ->
+    case lkey,rkey of
+      | l:'num',r:'num'-> return l < r
+      | l:'num',r      -> return true
+      | l:'str',r:'str'-> return l < r
+      | l:'str',r:'num'-> return false
+      | l:'str',r      -> return true
+      | l ,r@(_:'str'|_:'num') -> return false
+      | l,r            -> return type(l) < type(r)
+    end
+  end
+
+  -- str2doc : str -> Doc
+  local fun str2doc(s) -> text(format("%q",s)) end
+  
+  -- render_path : {Doc} -> Doc
+  local fun render_path
+    | nil -> empty
+    | xs  ->
+    local res = empty
+    for i=#xs,1,-1 do res += xs[i] end
+    return res
+  end
+  
+  -- get_addr : any -> str
+  local fun get_addr(o) ->
+    local _,_,addr = find(tostring(o),' (%x+)$')
+    return addr
+  end
+ 
+  -- prepare_table : {a,...} -> int,{{ak,av},...},Doc
+  -- returns sorted (k,v) pairs, len of array part and `Tag if any
+  local fun prepare_table(tab:'tab') ->
+    local res,tag,len = {},nil,0
+    -- NOTE: ipairs more accurate then `#'
+    for i,_ in ipairs(tab) do len = i end
+    for k,v in pairs(tab) do 
+      case k,v of
+        | TAG, tag1:'str' -> tag = tag1
+        | _, _            -> res `insert` {k,v}
+      end
+    end
+    -- sorting
+    sort(res,sort_pairs_by_key)
+    -- tag rendering
+    tag = tag and backtick+text(tag) or empty
+    --
+    return len,res,tag
+  end
+  
+  -- render_nonarray_part :: int,array, inout array -> int
+  -- NOTE: nonarray == num index not in (1..n) or hash part
+  local fun render_nonarray_part(from,sorted,res) ->
+    local last_i = from
+    for i=from, #sorted do
+      last_i = i
+      local sorted_k,sorted_v = sorted[i][1],sorted[i][2]
+      if sorted_k == 1 then break end
+      local new_key, is_id = key(sorted_k)
+      -- NOTE: key is `id' for pp and `.id' for Path
+      local new_path_el = is_id and dot+new_key or new_key
+      res[i] = (new_key+assign+value(sorted_v,new_path_el,...))
+    end
+    return last_i
+  end
+  
+-- +----------------------------------------+
+-- |    NOTE: type Path = varargs of Doc    |
+-- +----------------------------------------+
+  
+  -- table2doc : {any},Path -> {Doc}
+  local fun table2doc(tab:'tab') ->
+    local length,sorted,tag = prepare_table(tab)
+    local res = {}
+    local ii = 1
+    -- negative indexes first if any
+    case sorted of 
+      | {{x:'num',_},...} if x ~= 1 ->
+      ii = render_nonarray_part(ii,sorted,res,...)
+      | _ -> -- NOOP
+    end
+    -- proper array part next:
+    for i=ii,ii+length-1 do
+      res[i] = value(sorted[i][2],key(i),...)
+    end
+    -- rest
+    render_nonarray_part(ii+length,sorted,res,...)
+    return tag+tabled(res)
+  end
+  
+  -- list2doc :: list,{},Path -> {Doc},Doc?
+  local fun list2doc
+    | [],    accu -> accu
+    | x::xs, accu -> do 
+      accu[#accu+1] = value(x,key(1),...)
+      return list2doc(xs,accu,key(2),...)
+    end
+    | any,   accu -> accu, value(any,...)
+  end
+  
+
+  -- key : any -> Doc, [LikeId?]
+  fun key
+    | pair@( _::[] | _::_::_ ) -> brkangles$text$'pair: '..get_addr(pair)
+    | t:'tab'                  -> brkangles$text(t)
+    | i:'num'      -> brackets(text(i))
+    | []           -> brackets$consnullsp
+    | id:isLikeId  -> text(id), "ID"
+    | s:'str'      -> brackets$str2doc(s)
+    | nil          -> error('nil key?')
+    | any          -> brkangles$text(any)
+  end
+  
+  -- value :: (any, Path) -> Doc
+  fun value
+    | x:'tab' if tracker[x] -> tracker[x]
+    -- cluge prevents pp from treating any `Cat{1,2} as list
+    | lst@(_::[]|_::_::_) if not lst[TAG] -> do
+      tracker[lst] = render_path{...}
+      return listed(list2doc(lst,{},...))
+    end
+    | x:'tab' -> do 
+      tracker[x] = render_path{...} 
+      return table2doc(x,...)
+    end
+    | [] -> consnull
+    | s:'str' -> str2doc(s)
+    | o@(_:'fun'|_:'thread'|_:'udata') -> angles$text(o)
+    | o -> text(o)
+  end
+   
+  -- lua2doc return
+  return value(val,root_path)
+end -- lua2doc
+
+--------------------------------------------------------------------------
+--                                                              EXPORTS --
+--------------------------------------------------------------------------
+-- pp :: (any ,[str], [int], [float]) -> str 
+fun pp(obj,root@(nil|_:'str'),width@(nil|_:'num'),frac@(nil|_:'num'))->
+  return layout(lua2doc(obj,root),width,frac)
+end
+
+-- lua2doc :: any ,[string] -> Doc
+_M.lua2doc = lua2doc

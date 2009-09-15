@@ -1,0 +1,90 @@
+--------------------------------------------------------------------------
+--            __                    _                                   --
+--           / _|___ _ _ _ __  __ _| |_   ___ _ _ _ _ ___ _ _           --
+--          |  _/ _ \ '_| '  \/ _` |  _| / -_) '_| '_/ _ \ '_|          --
+--          |_| \___/_| |_|_|_\__,_|\__|_\___|_| |_| \___/_|            --
+--                                    |___|                             --
+--------------------------------------------------------------------------
+-- Error message formatter compatible with lua 5.0.x and 5.1.x.
+-- Ugly but simple and self-contained.
+--
+-- @author:  andrew_zhilin@yahoo.com
+-- @version: 0.6 beta
+-- Copyright (C) 2008, 2009 by zOOn
+
+-- NOTE: Using deprecated feature (arg).
+-- NOTE: Shoud be compiled by hluac with -lua50 option.
+--------------------------------------------------------------------------
+
+--------------------------------------------------------------------------
+-- require'strict' -- DEBUG:
+local getn = table.getn 
+local format,gsub  = string.format,string.gsub
+
+--------------------------------------------------------------------------
+-- errfmt :: (num, bool, ...) -> str
+local function errfmt(argn,varargs,...)
+  local MAX_TAB = 5
+  local args  = {...}
+  local argslen = #args
+  argslen = (argn and argn > argslen) and argn or argslen
+
+  local fun get_type
+    | o@(_:'tab'|_:'udata') ->
+    local mt = getmetatable(o)
+    if  mt and mt.type and type(mt.type)=='function' then
+      return o:type()
+    else
+      return type(o)
+    end
+    | o -> type(o)
+  end
+
+  local function atom(x)
+    if type(x) == 'string' then 
+      return format('%q:%s',x,'string') 
+    else 
+      return format('%s:%s',tostring(x), get_type(x)) end
+  end
+  
+  local function key(x)
+    if type(x) == 'number' then return ""
+    else return '['..atom(x)..']='
+    end
+  end
+
+  local function one_arg(i,x)
+    local what = 'arg#'..i..":\t"
+    if type(x) == 'table' then 
+      local n = 0
+      what ..='{'
+      for k,v in pairs(x) do 
+        what..=(key(k)..atom(v)..',')
+        n += 1 if n == MAX_TAB then what ..=" ..." break end
+      end
+      what..='}:'..get_type(x)
+    else what ..= atom(x) end
+    what..='\n'
+    return what
+  end
+  local res='pattern-match error:\n'
+  
+  if varargs ~= false then
+    res ..= 'varargs possible after arg#'..argn..'.\n' 
+  end
+  if argn ~= 0 then 
+    res..= argn.. ' args were expected; in fact we got:\n'
+  end
+  for i=1,argslen do
+    res..=one_arg(i,args[i])
+  end
+  if debug and type(debug) == 'table' then
+    -- NOTE: we remove '\t' from traceback to make easier for emacs
+    -- to jump to errors
+    return res..(gsub(debug.traceback(""),'\t',''))..'\n'
+  else return res
+  end
+end
+
+-- module return
+return errfmt
