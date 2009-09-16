@@ -143,8 +143,9 @@ local fun lua2doc(val,opt_root@(nil|_:'str'))->
   
   -- get_addr : any -> str
   local fun get_addr(o) ->
-    local _,_,addr = find(tostring(o),' (%x+)$')
-    return addr
+    local obj = tostring(o)
+    local _,_,addr = find(obj,': (.+)$')
+    return addr or obj
   end
  
   -- prepare_table : {a,...} -> int,{{ak,av},...},Doc
